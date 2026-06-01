@@ -1,3 +1,32 @@
 [build-system]
-build-backend = 'setuptools.build_meta'
-requires = ['setuptools']
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gigafile"
+dynamic = ["version"]
+description = "A python module to download and upload from gigafile.nu"
+authors = [{ name = "Sraqzit" }, { name = "fireattack" }, { name = "Skimige" }]
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.25.1",
+    "requests_toolbelt>=0.9.1",
+    "rich>=13",
+    "beautifulsoup4>=4",
+]
+
+[project.urls]
+Source = "https://github.com/Skimige/gfile"
+Tracker = "https://github.com/Skimige/gfile/issues"
+
+[project.scripts]
+gfile = "gfile.cmd:main"
+
+[tool.hatch.version]
+path = "gfile/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gfile"]

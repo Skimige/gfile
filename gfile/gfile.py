@@ -3,18 +3,29 @@ import functools
 import io
 import math
 import re
+import threading
 import time
 import uuid
 from datetime import datetime
 from os import rename
 from pathlib import Path
 from subprocess import run
+from urllib.parse import unquote
 
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from requests_toolbelt import MultipartEncoder, StreamingIterator
-from tqdm import tqdm
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 from urllib3.util.retry import Retry
 
 
@@ -37,6 +48,28 @@ def size_str_to_bytes(size_str):
     return int(math.pow(1024, units.index(unit)) * int(m['num']))
 
 
+def filename_from_content_disposition(value):
+    """Extract the real filename from a Content-Disposition header.
+
+    gigafile's download page (#dl) often shows a masked name (e.g. ******.bin)
+    and may not be rendered right after upload, but download.php always returns
+    the true filename in this header, so it's the authoritative source.
+    """
+    if not value:
+        return None
+    # RFC 5987 form is preferred: filename*=UTF-8''<percent-encoded>
+    m = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", value, re.IGNORECASE)
+    if m:
+        return unquote(m.group(1)).strip()
+    m = re.search(r'filename\s*=\s*"([^"]+)"', value, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'filename\s*=\s*([^;]+)', value, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 def requests_retry_session(
     retries=5,
     backoff_factor=0.2,
@@ -53,6 +86,19 @@ def requests_retry_session(
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     return session
+
+
+def make_progress(console):
+    """Create a rich Progress with a column layout shared by upload/download."""
+    return Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        TaskProgressColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
 
 
 def split_file(input_file, out, target_size=None, start=0, chunk_copy_size=1024*1024):
@@ -79,31 +125,62 @@ def split_file(input_file, out, target_size=None, start=0, chunk_copy_size=1024*
 
 
 class GFile:
-    def __init__(self, file_or_url, progress=False, thread_num=4, chunk_size=1024*1024*10, chunk_copy_size=1024*1024, timeout=10,
-                 aria2=False, key=None, mute=False, verify=True, **kwargs) -> None:
+    def __init__(self, file_or_url, progress=False, thread_num=4, chunk_size=1024*1024*30, chunk_copy_size=1024*1024, timeout=30,
+                 aria2=False, key=None, mute=False, verify=True, max_retries=10, proxy=None, **kwargs) -> None:
         self.file_or_url = file_or_url
         self.chunk_size = size_str_to_bytes(chunk_size)
         self.chunk_copy_size = size_str_to_bytes(chunk_copy_size)
         self.thread_num=thread_num
         self.progress = progress
         self.data = None
-        self.pbar = None
         self.timeout = timeout
+        self.max_retries = max_retries
         self.session = requests_retry_session()
-        self.session.request = functools.partial(self.session.request, timeout=self.timeout)
+        # (connect, read) timeout: fail fast on connect, be patient on read for flaky proxies.
+        self.session.request = functools.partial(self.session.request, timeout=(min(10, timeout), timeout))
+        if proxy:
+            self.session.proxies = {'http': proxy, 'https': proxy}
         self.cookies = None
         self.current_chunk = 0
+        self._chunk_lock = threading.Lock()
         self.aria2 = aria2
         self.mute = mute
         self.verify = verify
         self.key = key
+        self.console = Console()
+        # progress state (set up per upload/download run)
+        self._progress = None
+        self.tasks = None
+        self.total_task = None
+
+
+    def _info(self, msg):
+        # informational output, suppressed when muted
+        if not self.mute:
+            self.console.print(msg)
+
+    def _warn(self, msg):
+        if not self.mute:
+            self.console.print(msg, style='yellow')
+
+    def _err(self, msg):
+        # errors are always shown, even when muted
+        self.console.print(msg, style='bold red')
+
+
+    def _resolve_filename(self, header_name, web_name, output, idx, total):
+        # user-provided output always wins; otherwise prefer the authoritative
+        # header name, falling back to the (possibly masked) scraped page name.
+        if output:
+            return output + f'_{idx}' if total > 1 else output
+        return re.sub(r'[\\/:*?"<>|]', '_', header_name or web_name)
 
 
     def upload_chunk(self, chunk_no, chunks):
-        bar = self.pbar[chunk_no % self.thread_num] if self.pbar else None
+        task_id = self.tasks[chunk_no % self.thread_num] if self.tasks else None
         with io.BytesIO() as f:
             split_file(self.file_or_url, f, self.chunk_size, start=chunk_no * self.chunk_size, chunk_copy_size=self.chunk_copy_size)
-            chunk_size = f.tell()
+            raw_size = f.tell()
             f.seek(0)
             fields = {
                 "id": self.token,
@@ -122,130 +199,165 @@ class GFile:
             del form_data
 
         size = len(form_data_binary)
-        if bar:
-            bar.desc = f'chunk {chunk_no + 1}/{chunks}'
-            bar.reset(total=size)
-            # bar.refresh()
+
+        def reset_bar():
+            if task_id is not None:
+                self._progress.reset(task_id, total=size)
+                self._progress.update(task_id, description=f'chunk {chunk_no + 1}/{chunks}')
+
+        reset_bar()
 
         def gen():
             offset = 0
             while True:
+                if self.failed:
+                    break
                 if offset < size:
                     update_tick = 1024 * 128
                     yield form_data_binary[offset:offset + update_tick]
-                    if bar:
-                        bar.update(min(update_tick, size - offset))
-                        bar.refresh()
+                    if task_id is not None:
+                        self._progress.update(task_id, advance=min(update_tick, size - offset))
                     offset += update_tick
                 else:
                     if chunk_no != self.current_chunk:
                         time.sleep(0.01)
                     else:
                         break
-        while True:
+
+        resp_data = None
+        for attempt in range(self.max_retries):
+            if self.failed:
+                return
             try:
                 streamer = StreamingIterator(size, gen())
                 resp = self.session.post(f"https://{self.server}/upload_chunk.php", data=streamer, headers=headers)
+                resp_data = resp.json()
             except Exception as ex:
-                if not self.mute:
-                    print(ex)
-                    print('Retrying...')
+                wait = min(2 ** attempt, 30)
+                self._warn(f'chunk {chunk_no + 1}/{chunks} failed: {ex} Retrying in {wait}s ({attempt + 1}/{self.max_retries})...')
+                time.sleep(wait)
+                # the whole chunk gets re-sent, so rewind this worker's bar.
+                reset_bar()
             else:
                 break
+        else:
+            self._err(f'ERROR: chunk {chunk_no + 1}/{chunks} failed after {self.max_retries} attempts.')
+            self.failed = True
+            return
 
-        resp_data = resp.json()
-        self.current_chunk += 1
+        with self._chunk_lock:
+            self.current_chunk += 1
 
         if 'url' in resp_data:
             self.data = resp_data
         if 'status' not in resp_data or resp_data['status']:
-            print(resp_data)
+            self._err(str(resp_data))
             self.failed = True
+            return
+
+        # advance the overall progress by the raw (pre-encoding) size of this chunk
+        if self.total_task is not None:
+            self._progress.update(self.total_task, advance=raw_size)
 
 
     def upload(self):
         self.token = uuid.uuid1().hex
-        self.pbar = None
         self.failed = False
+        self.current_chunk = 0
+        self._progress = None
+        self.tasks = None
+        self.total_task = None
         assert Path(self.file_or_url).exists()
         size = Path(self.file_or_url).stat().st_size
         chunks = math.ceil(size / self.chunk_size)
-        if not self.mute:
-            print(f'Filesize {bytes_to_size_str(size)}, chunk size: {bytes_to_size_str(self.chunk_size)}, total chunks: {chunks}')
-
-        if self.progress:
-            self.pbar = []
-            for i in range(self.thread_num):
-                self.pbar.append(tqdm(total=size, unit="B", unit_scale=True, leave=False, unit_divisor=1024, ncols=100, position=i))
+        self._info(f'Filesize {bytes_to_size_str(size)}, chunk size: {bytes_to_size_str(self.chunk_size)}, total chunks: {chunks}')
 
         self.server = re.search(r'var server = "(.+?)"', self.session.get('https://gigafile.nu/').text)[1]
 
-        # upload the first chunk to set cookies properly.
-        self.upload_chunk(0, chunks)
+        if self.progress:
+            self._progress = make_progress(self.console)
+            self.total_task = self._progress.add_task('[cyan]Total', total=size)
+            self.tasks = [self._progress.add_task('waiting', total=1) for _ in range(self.thread_num)]
 
-        # upload second to second last chunk(s)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_num) as ex:
-            futures = {ex.submit(self.upload_chunk, i, chunks): i for i in range(1, chunks)}
-            try:
-                for future in concurrent.futures.as_completed(futures):
-                    if self.failed:
-                        print('ERROR: Upload failed!')
-                        for future in futures:
-                            future.cancel()
-                        return self
-            except KeyboardInterrupt:
-                print('\nUser cancelled the operation.')
-                for future in futures:
-                    future.cancel()
-                return self
+        try:
+            if self._progress:
+                self._progress.start()
+            # upload the first chunk to set cookies properly.
+            self.upload_chunk(0, chunks)
 
-        if self.pbar:
-            for bar in self.pbar:
-                bar.close()
-        print('')
-        if 'url' not in self.data:
-            print('ERROR: Something went wrong and upload failed. Returned data:', self.data)
+            # upload second to second last chunk(s)
+            if not self.failed:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_num) as executor:
+                    futures = {executor.submit(self.upload_chunk, i, chunks): i for i in range(1, chunks)}
+                    try:
+                        for future in concurrent.futures.as_completed(futures):
+                            try:
+                                future.result()
+                            except Exception as ex:
+                                self.failed = True
+                                self._err(f'ERROR: unexpected exception in worker: {ex}')
+                            if self.failed:
+                                for fut in futures:
+                                    fut.cancel()
+                                break
+                    except KeyboardInterrupt:
+                        self.failed = True
+                        self._err('\nUser cancelled the operation.')
+                        for fut in futures:
+                            fut.cancel()
+        finally:
+            if self._progress:
+                # drop the per-worker bars, keep only the overall one in the final render.
+                for tid in (self.tasks or []):
+                    self._progress.remove_task(tid)
+                self._progress.stop()
+
+        if self.failed:
+            self._err('ERROR: Upload failed!')
+            return self
+        if not self.data or 'url' not in self.data:
+            self._err(f'ERROR: Something went wrong and upload failed. Returned data: {self.data}')
             return self
         self.data['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         return self # for chain
 
 
     def get_download_page(self):
+        if not self.data or 'url' not in self.data:
+            return
         uploaded_url = self.data['url']
 
         f = Path(self.file_or_url)
         f_size = f.stat().st_size
         if self.verify:
-            if not self.mute:
-                print(f"Check if the file {f.name} is uploaded successfully...")
+            self._info(f"Check if the file {f.name} is uploaded successfully...")
             files_info = self.parse_download_page(uploaded_url)
             file_id = files_info[0][2]
             download_url = uploaded_url.rsplit('/', 1)[0] + '/download.php?file=' + file_id
             with self.session.get(download_url, stream=True) as r:
                 uploaded_size = int(r.headers.get('Content-Length', 0))
             if not uploaded_size or uploaded_size != f_size:
-                print(f"ERROR: File size of {f.name} at {uploaded_url} mismatches: expected {f_size}, got {uploaded_size}.")
-                print('This means the upload is corrupted. Please try again.')
+                self._err(f"ERROR: File size of {f.name} at {uploaded_url} mismatches: expected {f_size}, got {uploaded_size}.")
+                self._err('This means the upload is corrupted. Please try again.')
                 return
-            if not self.mute:
-                print(f"Uploaded file {f.name} is verified successfully.")
+            self._info(f"[green]Uploaded file {f.name} is verified successfully.")
 
-        print(f"Finished at {self.data['finished_at']}, filename: {f.name}, size: {bytes_to_size_str(f_size)}")
-        print(uploaded_url)
+        self.console.print(f"Finished at {self.data['finished_at']}, filename: {f.name}, size: {bytes_to_size_str(f_size)}")
+        self.console.print(uploaded_url)
         return uploaded_url
 
 
     def parse_download_page(self, url):
         m = re.search(r'^https?:\/\/\d+?\.gigafile\.nu\/([a-z0-9-]+)$', url)
         if not m:
-            print(f'ERROR: Invalid URL: {url}. It should be a valid gigafile URL.')
+            self._err(f'ERROR: Invalid URL: {url}. It should be a valid gigafile URL.')
             return
         r = self.session.get(url) # setup cookie
         files_info = []
         try:
             soup = BeautifulSoup(r.text, 'html.parser')
             if soup.select_one('#contents_matomete'):
-                print('Matomete page (multiple files). Files will be downloaded one by one.')
+                self._info('Matomete page (multiple files). Files will be downloaded one by one.')
                 for ele in soup.select('.matomete_file'):
                     web_name = ele.select_one('.matomete_file_info > span:nth-child(2)').text.strip()
                     file_id = re.search(r'download\(\d+, *\'(.+?)\'', ele.select_one('.download_panel_btn_dl')['onclick'])[1]
@@ -257,12 +369,12 @@ class GFile:
                 web_name = soup.select_one('#dl').text.strip()
                 files_info.append((web_name, size_str, file_id))
         except Exception as ex:
-            print(f'ERROR: Failed to parse the page {url}.')
-            print(ex)
-            print('Please report it back to the developer.')
+            self._err(f'ERROR: Failed to parse the page {url}.')
+            self._err(str(ex))
+            self._err('Please report it back to the developer.')
             return
         if len(files_info) > 1:
-            print(f'Found {len(files_info)} files in the page.')
+            self._info(f'Found {len(files_info)} files in the page.')
         return files_info
 
 
@@ -271,47 +383,57 @@ class GFile:
         files_info = self.parse_download_page(self.file_or_url)
         if not files_info:
             return downloaded
+        total = len(files_info)
         for idx, (web_name, size_str, file_id) in enumerate(files_info, 1):
-            print(f'Name: {web_name}, size: {size_str}, id: {file_id}')
-            # only sanitize web filename. User provided output string(s) are on their own.
-            if not output:
-                filename = re.sub(r'[\\/:*?"<>|]', '_', web_name)
-            else:
-                if len(files_info) > 1:
-                    # if there are more than one files, append idx to the filename
-                    filename = output + f'_{idx}'
-                else:
-                    filename = output
-
             download_url = self.file_or_url.rsplit('/', 1)[0] + '/download.php?file=' + file_id
             if self.key:
                 download_url += f'&dlkey={self.key}'
+
             if self.aria2:
+                header_name = None
+                if not output:
+                    # download.php doesn't answer HEAD, so peek at the headers via a
+                    # streaming GET and close it immediately without reading the body.
+                    with self.session.get(download_url, stream=True) as r:
+                        header_name = filename_from_content_disposition(r.headers.get('Content-Disposition'))
+                filename = self._resolve_filename(header_name, web_name, output, idx, total)
+                self._info(f'Name: {filename}, size: {size_str}, id: {file_id}')
                 cookie_str = "; ".join([f"{cookie.name}={cookie.value}" for cookie in self.session.cookies])
                 cmd = ['aria2c', download_url, '--header', f'Cookie: {cookie_str}', '-o', filename]
                 cmd.extend(self.aria2.split(' '))
                 run(cmd)
                 continue
 
-            temp = filename + '.dl'
             with self.session.get(download_url, stream=True) as r:
                 r.raise_for_status()
                 filesize = int(r.headers['Content-Length'])
+                header_name = filename_from_content_disposition(r.headers.get('Content-Disposition'))
+                filename = self._resolve_filename(header_name, web_name, output, idx, total)
+                temp = filename + '.dl'
+                self._info(f'Name: {filename}, size: {size_str}, id: {file_id}')
+                progress = None
+                task_id = None
                 if self.progress:
                     desc = filename if len(filename) <= 20 else filename[0:11] + '..' + filename[-7:]
-                    self.pbar = tqdm(total=filesize, unit='B', unit_scale=True, unit_divisor=1024, desc=desc)
-                with open(temp, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=self.chunk_copy_size):
-                        f.write(chunk)
-                        if self.pbar: self.pbar.update(len(chunk))
-            if self.pbar: self.pbar.close()
+                    progress = make_progress(self.console)
+                    task_id = progress.add_task(desc, total=filesize)
+                    progress.start()
+                try:
+                    with open(temp, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=self.chunk_copy_size):
+                            f.write(chunk)
+                            if progress is not None:
+                                progress.update(task_id, advance=len(chunk))
+                finally:
+                    if progress is not None:
+                        progress.stop()
 
             filesize_downloaded = Path(temp).stat().st_size
-            print(f'Filesize check: expected: {filesize}; actual: {filesize_downloaded}', end=' ')
             if filesize == filesize_downloaded:
-                print("Succeeded.")
+                self.console.print(f'[green]Filesize check passed ({bytes_to_size_str(filesize)}). Succeeded.')
                 rename(temp, filename)
             else:
-                print(f"ERROR: Downloaded file is corrupt. Please check the broken file at {temp} and delete it yourself if needed.")
+                self._err(f'ERROR: Downloaded file is corrupt (expected {filesize}, got {filesize_downloaded}). '
+                          f'Please check the broken file at {temp} and delete it yourself if needed.')
             downloaded.append(filename)
         return downloaded
