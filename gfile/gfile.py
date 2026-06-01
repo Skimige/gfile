@@ -32,7 +32,7 @@ from urllib3.util.retry import Retry
 def bytes_to_size_str(bytes):
    if bytes == 0:
        return "0B"
-   units = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+   units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB")
    i = int(math.floor(math.log(bytes, 1024)))
    p = math.pow(1024, i)
    return f"{bytes/p:.02f} {units[i]}"
@@ -94,7 +94,7 @@ def make_progress(console):
         TextColumn("[progress.description]{task.description}"),
         BarColumn(bar_width=None),
         TaskProgressColumn(),
-        DownloadColumn(),
+        DownloadColumn(binary_units=True),
         TransferSpeedColumn(),
         TimeRemainingColumn(),
         console=console,
