@@ -1,4 +1,5 @@
 import concurrent.futures
+import concurrent.futures.thread
 import functools
 import io
 import math
@@ -126,11 +127,14 @@ def split_file(input_file, out, target_size=None, start=0, chunk_copy_size=1024*
 
 class GFile:
     def __init__(self, file_or_url, progress=False, thread_num=4, chunk_size=1024*1024*30, chunk_copy_size=1024*1024, timeout=30,
-                 aria2=False, key=None, mute=False, verify=True, max_retries=10, proxy=None, **kwargs) -> None:
+                 aria2=False, key=None, mute=False, verify=True, max_retries=10, proxy=None, window=2, **kwargs) -> None:
         self.file_or_url = file_or_url
         self.chunk_size = size_str_to_bytes(chunk_size)
         self.chunk_copy_size = size_str_to_bytes(chunk_copy_size)
         self.thread_num=thread_num
+        # in-flight window: how many chunks may be uploading concurrently. See
+        # the send-gate in upload_chunk for why a small window is more robust.
+        self.window = max(1, window)
         self.progress = progress
         self.data = None
         self.timeout = timeout
@@ -178,6 +182,18 @@ class GFile:
 
     def upload_chunk(self, chunk_no, chunks):
         task_id = self.tasks[chunk_no % self.thread_num] if self.tasks else None
+        # send-gate: stay off the wire (and out of memory) until we're within
+        # `window` chunks of the completion frontier. gigafile commits chunks
+        # strictly in ascending order, so a chunk that has finished uploading
+        # must hold its connection open until its turn -- wait too long and the
+        # server drops the stale connection, wasting the whole re-sent chunk.
+        # Gating *before* we read/encode/upload bounds that hold to ~`window`
+        # chunks, so a finished chunk is never left idling long enough to be
+        # discarded; `window` is thus the effective upload concurrency.
+        while not self.failed and chunk_no - self.current_chunk >= self.window:
+            time.sleep(0.05)
+        if self.failed:
+            return
         with io.BytesIO() as f:
             split_file(self.file_or_url, f, self.chunk_size, start=chunk_no * self.chunk_size, chunk_copy_size=self.chunk_copy_size)
             raw_size = f.tell()
@@ -233,6 +249,10 @@ class GFile:
                 resp = self.session.post(f"https://{self.server}/upload_chunk.php", data=streamer, headers=headers)
                 resp_data = resp.json()
             except Exception as ex:
+                # if the upload was cancelled/aborted elsewhere, the failure is
+                # just the truncated request unwinding -- bail quietly, no retry.
+                if self.failed:
+                    return
                 wait = min(2 ** attempt, 30)
                 self._warn(f'chunk {chunk_no + 1}/{chunks} failed: {ex} Retrying in {wait}s ({attempt + 1}/{self.max_retries})...')
                 time.sleep(wait)
@@ -279,6 +299,10 @@ class GFile:
             self.total_task = self._progress.add_task('[cyan]Total', total=size)
             self.tasks = [self._progress.add_task('waiting', total=1) for _ in range(self.thread_num)]
 
+        # managed manually (not via `with`) so the cancel path can avoid the
+        # blocking shutdown(wait=True) that `__exit__` would otherwise perform.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_num)
+        futures = {}
         try:
             if self._progress:
                 self._progress.start()
@@ -287,25 +311,33 @@ class GFile:
 
             # upload second to second last chunk(s)
             if not self.failed:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_num) as executor:
-                    futures = {executor.submit(self.upload_chunk, i, chunks): i for i in range(1, chunks)}
+                futures = {executor.submit(self.upload_chunk, i, chunks): i for i in range(1, chunks)}
+                for future in concurrent.futures.as_completed(futures):
                     try:
-                        for future in concurrent.futures.as_completed(futures):
-                            try:
-                                future.result()
-                            except Exception as ex:
-                                self.failed = True
-                                self._err(f'ERROR: unexpected exception in worker: {ex}')
-                            if self.failed:
-                                for fut in futures:
-                                    fut.cancel()
-                                break
-                    except KeyboardInterrupt:
+                        future.result()
+                    except Exception as ex:
                         self.failed = True
-                        self._err('\nUser cancelled the operation.')
+                        self._err(f'ERROR: unexpected exception in worker: {ex}')
+                    if self.failed:
                         for fut in futures:
                             fut.cancel()
+                        break
+        except KeyboardInterrupt:
+            self.failed = True
+            self._warn('\nUpload cancelled by user.')
+            for fut in futures:
+                fut.cancel()
+            raise  # let main() report it with a clean exit code
         finally:
+            if self.failed:
+                # don't block on workers stuck in network I/O; abandon the
+                # in-flight POSTs and skip the atexit thread join so the
+                # process can exit immediately and cleanly.
+                executor.shutdown(wait=False)
+                concurrent.futures.thread._threads_queues.clear()
+            else:
+                # workers are already idle here, so this returns right away.
+                executor.shutdown(wait=True)
             if self._progress:
                 # drop the per-worker bars, keep only the overall one in the final render.
                 for tid in (self.tasks or []):

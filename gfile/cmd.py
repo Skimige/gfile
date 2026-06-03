@@ -1,5 +1,6 @@
 
 import argparse
+import sys
 from enum import Enum
 
 if __name__ == '__main__' and __package__ is None:
@@ -23,8 +24,9 @@ def main():
     parser.add_argument('-p', '--hide-progress', dest='progress', action='store_false', default=True, help='hide progress bar')
     parser.add_argument('-o', '--output', type=str, default=None, help='output filename for download (default: use original name)')
     parser.add_argument('--aria2', nargs='?', const="-x10 -s10", default=None, help='download with aria2. You can also specify optional arguments (default: "-x10 -s10", make sure to quote). `-o` is already automatically included.')
-    parser.add_argument('-n', '--thread-num', dest='thread_num', default=8, type=int, help='number of threads used for upload [default: 8]')
-    parser.add_argument('-s', '--chunk-size', dest='chunk_size', default="30MB", help='chunk size per upload in bytes; note: ~2*chunk_size*thread may be loaded into memory. Smaller chunks waste less on retries over flaky networks [default: 30MB]')
+    parser.add_argument('-n', '--thread-num', dest='thread_num', default=8, type=int, help='number of worker threads (chunk prep/look-ahead pool); effective upload concurrency is capped by --window [default: 8]')
+    parser.add_argument('-w', '--window', dest='window', default=2, type=int, help='max chunks uploading concurrently (in-flight window). gigafile commits chunks strictly in order, so a smaller window is more robust on slow/flaky links (less wasted re-sending) while a larger one is faster on good ones [default: 2]')
+    parser.add_argument('-s', '--chunk-size', dest='chunk_size', default="30MB", help='chunk size per upload in bytes; note: ~2*chunk_size*window may be loaded into memory. Smaller chunks waste less on retries over flaky networks [default: 30MB]')
     parser.add_argument('-m', '--copy-size', dest='chunk_copy_size', default="1MB", help='specifies size to copy the main file into pieces [default: 1MB]')
     parser.add_argument('-t', '--timeout', type=int, default=30, help='read timeout (in seconds); connect timeout is min(10, timeout) [default: 30]')
     parser.add_argument('-r', '--max-retries', dest='max_retries', type=int, default=10, help='max retry attempts per chunk, with exponential backoff [default: 10]')
@@ -38,10 +40,15 @@ def main():
     args = parser.parse_args()
 
     gf = GFile(**args.__dict__)
-    if args.action == Action.download:
-        gf.download(args.output)
-    else:
-        gf.upload().get_download_page()
+    try:
+        if args.action == Action.download:
+            gf.download(args.output)
+        else:
+            gf.upload().get_download_page()
+    except KeyboardInterrupt:
+        # graceful Ctrl+C: no traceback, conventional 130 exit code
+        print()
+        sys.exit(130)
 
 if __name__ == "__main__":
     main()
