@@ -4,8 +4,6 @@ __pycache__/
 *$py.class
 .vscode/
 
-tests/
-test*
 note.txt
 
 # C extensions

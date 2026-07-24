@@ -1,5 +1,5 @@
-from .gfile import GFile
+from .gfile import GFile as GFile
 
 
 __author__ = """Sraqzit, fireattack, Skimige"""
-__version__ = '3.3.0'
+__version__ = '3.4.0'
