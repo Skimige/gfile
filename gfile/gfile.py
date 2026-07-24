@@ -132,8 +132,9 @@ class GFile:
         self.chunk_size = size_str_to_bytes(chunk_size)
         self.chunk_copy_size = size_str_to_bytes(chunk_copy_size)
         self.thread_num=thread_num
-        # in-flight window: how many chunks may be uploading concurrently. See
-        # the send-gate in upload_chunk for why a small window is more robust.
+        # in-flight window: how many chunks may normally be uploading
+        # concurrently. See the admission gate in upload_chunk for the exact
+        # semantics (it is soft in one direction to avoid idle bandwidth).
         self.window = max(1, window)
         self.progress = progress
         self.data = None
@@ -146,7 +147,10 @@ class GFile:
             self.session.proxies = {'http': proxy, 'https': proxy}
         self.cookies = None
         self.current_chunk = 0
-        self._chunk_lock = threading.Lock()
+        # coordinates chunk admission, sender accounting and in-order commits
+        self._cond = threading.Condition()
+        self.next_send = 0
+        self.active_senders = 0
         self.aria2 = aria2
         self.mute = mute
         self.verify = verify
@@ -182,108 +186,165 @@ class GFile:
 
     def upload_chunk(self, chunk_no, chunks):
         task_id = self.tasks[chunk_no % self.thread_num] if self.tasks else None
-        # send-gate: stay off the wire (and out of memory) until we're within
-        # `window` chunks of the completion frontier. gigafile commits chunks
-        # strictly in ascending order, so a chunk that has finished uploading
-        # must hold its connection open until its turn -- wait too long and the
-        # server drops the stale connection, wasting the whole re-sent chunk.
-        # Gating *before* we read/encode/upload bounds that hold to ~`window`
-        # chunks, so a finished chunk is never left idling long enough to be
-        # discarded; `window` is thus the effective upload concurrency.
-        while not self.failed and chunk_no - self.current_chunk >= self.window:
-            time.sleep(0.05)
-        if self.failed:
-            return
-        with io.BytesIO() as f:
-            split_file(self.file_or_url, f, self.chunk_size, start=chunk_no * self.chunk_size, chunk_copy_size=self.chunk_copy_size)
-            raw_size = f.tell()
-            f.seek(0)
-            fields = {
-                "id": self.token,
-                "name": Path(self.file_or_url).name,
-                "chunk": str(chunk_no),
-                "chunks": str(chunks),
-                "lifetime": "100",
-                "file": ("blob", f, "application/octet-stream"),
-            }
-            form_data = MultipartEncoder(fields)
-            headers = {
-                "content-type": form_data.content_type,
-            }
-            # convert the form-data into a binary string, this way we can control/throttle its read() behavior
-            form_data_binary = form_data.to_string()
-            del form_data
-
-        size = len(form_data_binary)
-
-        def reset_bar():
-            if task_id is not None:
-                self._progress.reset(task_id, total=size)
-                self._progress.update(task_id, description=f'chunk {chunk_no + 1}/{chunks}')
-
-        reset_bar()
-
-        def gen():
-            offset = 0
-            while True:
-                if self.failed:
-                    break
-                if offset < size:
-                    update_tick = 1024 * 128
-                    yield form_data_binary[offset:offset + update_tick]
-                    if task_id is not None:
-                        self._progress.update(task_id, advance=min(update_tick, size - offset))
-                    offset += update_tick
-                else:
-                    if chunk_no != self.current_chunk:
-                        time.sleep(0.01)
-                    else:
-                        break
-
-        resp_data = None
-        for attempt in range(self.max_retries):
+        # admission gate: chunks enter the wire strictly in order, normally at
+        # most `window` ahead of the commit frontier, so a parked chunk (see
+        # the tail-hold in gen below) never idles long enough for the server
+        # to drop its connection. The window is soft in one direction: when
+        # every in-flight chunk has finished sending and is parked waiting to
+        # commit, the next chunk is admitted early so the link never sits idle
+        # while the commit chain drains. In-flight chunks -- and thus memory,
+        # at ~chunk_size each -- are capped by the worker pool (thread_num).
+        with self._cond:
+            while not self.failed and not (chunk_no == self.next_send and (
+                    chunk_no - self.current_chunk < self.window or self.active_senders == 0)):
+                self._cond.wait(0.05)
             if self.failed:
                 return
-            try:
-                streamer = StreamingIterator(size, gen())
-                resp = self.session.post(f"https://{self.server}/upload_chunk.php", data=streamer, headers=headers)
-                resp_data = resp.json()
-            except Exception as ex:
-                # if the upload was cancelled/aborted elsewhere, the failure is
-                # just the truncated request unwinding -- bail quietly, no retry.
+            self.next_send += 1
+            self.active_senders += 1
+        sender = True
+
+        def become_sender():
+            nonlocal sender
+            if not sender:
+                with self._cond:
+                    self.active_senders += 1
+                sender = True
+
+        def release_sender():
+            nonlocal sender
+            if sender:
+                with self._cond:
+                    self.active_senders -= 1
+                    self._cond.notify_all()
+                sender = False
+
+        try:
+            with io.BytesIO() as f:
+                split_file(self.file_or_url, f, self.chunk_size, start=chunk_no * self.chunk_size, chunk_copy_size=self.chunk_copy_size)
+                raw_size = f.tell()
+                f.seek(0)
+                fields = {
+                    "id": self.token,
+                    "name": Path(self.file_or_url).name,
+                    "chunk": str(chunk_no),
+                    "chunks": str(chunks),
+                    "lifetime": "100",
+                    "file": ("blob", f, "application/octet-stream"),
+                }
+                form_data = MultipartEncoder(fields)
+                headers = {
+                    "content-type": form_data.content_type,
+                }
+                # convert the form-data into a binary string, this way we can control/throttle its read() behavior
+                form_data_binary = form_data.to_string()
+                del form_data
+
+            size = len(form_data_binary)
+            update_tick = 1024 * 128
+            # gigafile commits chunks strictly in ascending order -- an
+            # out-of-order completion corrupts the file *silently* -- so the
+            # final piece of the body is held back until every earlier chunk
+            # has committed. Completion order is thus guaranteed by
+            # construction rather than by how the concurrent uploads happen to
+            # race, and a parked chunk needs only one tick to commit once its
+            # turn arrives.
+            bulk_end = max(0, size - update_tick)
+
+            def set_state(state=''):
+                if task_id is not None:
+                    desc = f'chunk {chunk_no + 1}/{chunks}'
+                    if state:
+                        desc += f' [dim]({state})[/]'
+                    self._progress.update(task_id, description=desc)
+
+            def reset_bar():
+                if task_id is not None:
+                    self._progress.reset(task_id, total=size)
+                set_state()
+
+            def gen():
+                offset = 0
+                while offset < bulk_end:
+                    if self.failed:
+                        return
+                    piece_end = min(offset + update_tick, bulk_end)
+                    yield form_data_binary[offset:piece_end]
+                    if task_id is not None:
+                        self._progress.update(task_id, advance=piece_end - offset)
+                    offset = piece_end
+                # bulk is on the wire; stop counting as a sender so the gate
+                # can admit the next chunk while this one waits for its turn.
+                release_sender()
+                if chunk_no != self.current_chunk:
+                    set_state('waiting turn')
+                with self._cond:
+                    while not self.failed and chunk_no != self.current_chunk:
+                        self._cond.wait(0.05)
                 if self.failed:
                     return
-                wait = min(2 ** attempt, 30)
-                self._warn(f'chunk {chunk_no + 1}/{chunks} failed: {ex} Retrying in {wait}s ({attempt + 1}/{self.max_retries})...')
-                time.sleep(wait)
-                # the whole chunk gets re-sent, so rewind this worker's bar.
-                reset_bar()
+                yield form_data_binary[offset:]
+                if task_id is not None:
+                    self._progress.update(task_id, advance=size - offset)
+                # resumed here means the tail has been handed to the socket:
+                # the body is fully sent and we are waiting on the server.
+                set_state('waiting response')
+
+            reset_bar()
+
+            resp_data = None
+            for attempt in range(self.max_retries):
+                if self.failed:
+                    return
+                become_sender()
+                try:
+                    streamer = StreamingIterator(size, gen())
+                    resp = self.session.post(f"https://{self.server}/upload_chunk.php", data=streamer, headers=headers)
+                    resp_data = resp.json()
+                except Exception as ex:
+                    # if the upload was cancelled/aborted elsewhere, the failure is
+                    # just the truncated request unwinding -- bail quietly, no retry.
+                    if self.failed:
+                        return
+                    # not transmitting during the backoff; let others send.
+                    release_sender()
+                    wait = min(2 ** attempt, 30)
+                    self._warn(f'chunk {chunk_no + 1}/{chunks} failed: {ex} Retrying in {wait}s ({attempt + 1}/{self.max_retries})...')
+                    time.sleep(wait)
+                    # the whole chunk gets re-sent, so rewind this worker's bar.
+                    reset_bar()
+                else:
+                    break
             else:
-                break
-        else:
-            self._err(f'ERROR: chunk {chunk_no + 1}/{chunks} failed after {self.max_retries} attempts.')
-            self.failed = True
-            return
+                self._err(f'ERROR: chunk {chunk_no + 1}/{chunks} failed after {self.max_retries} attempts.')
+                self.failed = True
+                return
 
-        with self._chunk_lock:
-            self.current_chunk += 1
+            with self._cond:
+                self.current_chunk += 1
+                self._cond.notify_all()
+            set_state('done')
 
-        if 'url' in resp_data:
-            self.data = resp_data
-        if 'status' not in resp_data or resp_data['status']:
-            self._err(str(resp_data))
-            self.failed = True
-            return
+            if 'url' in resp_data:
+                self.data = resp_data
+            if 'status' not in resp_data or resp_data['status']:
+                self._err(str(resp_data))
+                self.failed = True
+                return
 
-        # advance the overall progress by the raw (pre-encoding) size of this chunk
-        if self.total_task is not None:
-            self._progress.update(self.total_task, advance=raw_size)
+            # advance the overall progress by the raw (pre-encoding) size of this chunk
+            if self.total_task is not None:
+                self._progress.update(self.total_task, advance=raw_size)
+        finally:
+            release_sender()
 
 
     def upload(self):
         self.token = uuid.uuid1().hex
         self.failed = False
         self.current_chunk = 0
+        self.next_send = 0
+        self.active_senders = 0
         self._progress = None
         self.tasks = None
         self.total_task = None
