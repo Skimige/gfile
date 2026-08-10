@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "gigafile"
 dynamic = ["version"]
-description = "A python module to download and upload from gigafile.nu"
+description = "A python module to download and upload from gigafile"
 authors = [{ name = "Sraqzit" }, { name = "fireattack" }, { name = "Skimige" }]
 readme = "README.md"
 license = "GPL-3.0-or-later"

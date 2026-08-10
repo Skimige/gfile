@@ -32,6 +32,18 @@ from rich.progress import (
 )
 from urllib3.util.retry import Retry
 
+PRIMARY_DOMAIN = 'gigafile.jp'
+
+
+def normalize_gigafile_url(url):
+    """Normalize a gigafile URL to use the primary domain (.jp)."""
+    return re.sub(
+        r'^(https?://\d+)\.gigafile\.nu(?=/)',
+        rf'\1.{PRIMARY_DOMAIN}',
+        url,
+        flags=re.IGNORECASE,
+    )
+
 
 DOWNLOAD_BLOCK_SIZE = 16 * 1024 * 1024
 
@@ -151,6 +163,8 @@ class GFile:
     def __init__(self, file_or_url, progress=False, thread_num=4, chunk_size=1024*1024*30, chunk_copy_size=1024*1024, timeout=30,
                  aria2=False, key=None, mute=False, verify=True, max_retries=10, proxy=None, window=2,
                  download_threads=4, **kwargs) -> None:
+        if isinstance(file_or_url, str):
+            file_or_url = normalize_gigafile_url(file_or_url)
         self.file_or_url = file_or_url
         self.chunk_size = size_str_to_bytes(chunk_size)
         self.chunk_copy_size = size_str_to_bytes(chunk_copy_size)
@@ -377,7 +391,7 @@ class GFile:
         chunks = math.ceil(size / self.chunk_size)
         self._info(f'Filesize {bytes_to_size_str(size)}, chunk size: {bytes_to_size_str(self.chunk_size)}, total chunks: {chunks}')
 
-        self.server = re.search(r'var server = "(.+?)"', self.session.get('https://gigafile.nu/').text)[1]
+        self.server = re.search(r'var server = "(.+?)"', self.session.get(f'https://{PRIMARY_DOMAIN}/').text)[1]
 
         if self.progress:
             self._progress = make_progress(self.console)
@@ -442,7 +456,7 @@ class GFile:
     def get_download_page(self):
         if not self.data or 'url' not in self.data:
             return
-        uploaded_url = self.data['url']
+        uploaded_url = normalize_gigafile_url(self.data['url'])
 
         f = Path(self.file_or_url)
         f_size = f.stat().st_size
@@ -465,10 +479,12 @@ class GFile:
 
 
     def parse_download_page(self, url):
-        m = re.search(r'^https?:\/\/\d+?\.gigafile\.nu\/([a-z0-9-]+)$', url)
+        m = re.search(r'^https?:\/\/(\d+?)\.gigafile\.(?:jp|nu)\/([a-z0-9-]+)$', url)
         if not m:
             self._err(f'ERROR: Invalid URL: {url}. It should be a valid gigafile URL.')
             return
+        url = normalize_gigafile_url(url)
+        file_id = m[2]
         r = self.session.get(url) # setup cookie
         files_info = []
         try:
@@ -481,7 +497,6 @@ class GFile:
                     size_str = re.search(r'（(.+?)）', ele.select_one('.matomete_file_info > span:nth-child(3)').text.strip())[1]
                     files_info.append((web_name, size_str, file_id))
             else:
-                file_id = m[1]
                 size_str = soup.select_one('.dl_size').text.strip()
                 web_name = soup.select_one('#dl').text.strip()
                 files_info.append((web_name, size_str, file_id))

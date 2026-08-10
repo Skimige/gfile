@@ -1,6 +1,6 @@
 # gfile
 
-A python CLI/module to download and upload from [gigafile](https://gigafile.nu/).
+A python CLI/module to download and upload from [gigafile](https://gigafile.jp/). Both `.jp` and legacy `.nu` share URLs are accepted.
 
 This is a fork of [fireattack/gfile](https://github.com/fireattack/gfile) (itself a major update from [the original](https://github.com/Sraq-Zit/gfile)), with additional changes:
 
@@ -35,9 +35,9 @@ Or with pip:
 ```bash
 $ gfile upload path/to/file
 
-$ gfile download https://66.gigafile.nu/0320-b36ec21d4a56b143537e12df7388a5367
+$ gfile download https://66.gigafile.jp/0320-b36ec21d4a56b143537e12df7388a5367
 
-$ gfile download https://66.gigafile.nu/0320-b36ec21d4a56b143537e12df7388a5367 --download-threads 8
+$ gfile download https://66.gigafile.jp/0320-b36ec21d4a56b143537e12df7388a5367 --download-threads 8
 
 $ gfile -h
 usage: Gfile [-h] [--version] [-p] [-o OUTPUT] [--aria2 [ARIA2]]
@@ -111,7 +111,7 @@ from gfile import GFile
 #### Download
 ```py
 filename = GFile(
-    'https://XX.gigafile.nu/YYY',
+    'https://XX.gigafile.jp/YYY',
     download_threads=8,
 ).download()
 ```

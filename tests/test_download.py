@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gfile import cmd
-from gfile.gfile import GFile, parse_content_range
+from gfile.gfile import GFile, normalize_gigafile_url, parse_content_range
 
 
 class FakeResponse:
@@ -330,6 +330,19 @@ class ContentRangeTests(unittest.TestCase):
     def test_rejects_unknown_or_malformed_range(self):
         self.assertIsNone(parse_content_range('bytes 4-9/*'))
         self.assertIsNone(parse_content_range('not-a-range'))
+
+
+class GigafileUrlTests(unittest.TestCase):
+    def test_normalizes_legacy_share_url(self):
+        self.assertEqual(
+            normalize_gigafile_url('https://12.gigafile.nu/example'),
+            'https://12.gigafile.jp/example',
+        )
+
+    def test_does_not_rewrite_local_filename(self):
+        filename = 'backup.gigafile.nu.zip'
+
+        self.assertEqual(normalize_gigafile_url(filename), filename)
 
 
 class CommandTests(unittest.TestCase):
