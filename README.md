@@ -64,21 +64,19 @@ options:
                         downloader; use 1 for sequential download [default: 4]
   -n, --thread-num THREAD_NUM
                         number of worker threads; also the hard cap on in-
-                        flight chunks (and thus memory use) when the soft
-                        window is exceeded to keep the link busy [default: 8]
-  -w, --window WINDOW   target number of chunks uploading concurrently (soft
-                        in-flight window; when all in-flight chunks are parked
-                        waiting to commit, one extra is admitted so the link
-                        never idles). gigafile commits chunks strictly in
+                        flight chunks and upload memory use [default: 8]
+  -w, --window WINDOW   target number of chunks actively uploading. A chunk
+                        waiting to commit gives up its sender slot so the next
+                        chunk can start. gigafile commits chunks strictly in
                         order, so a smaller window is more robust on
                         slow/flaky links (less wasted re-sending) while a
                         larger one is faster on good ones [default: 2]
   -s, --chunk-size CHUNK_SIZE
                         chunk size per upload in bytes; note: each in-flight
-                        chunk holds ~chunk_size in memory, normally ~window+1
-                        chunks, up to thread_num when commits are slow.
-                        Smaller chunks waste less on retries over flaky
-                        networks [default: 30MB]
+                        chunk holds ~chunk_size in memory, with up to
+                        thread_num chunks when later chunks repeatedly
+                        overtake earlier ones. Smaller chunks waste less on
+                        retries over flaky networks [default: 30MB]
   -m, --copy-size CHUNK_COPY_SIZE
                         specifies size to copy the main file into pieces
                         [default: 1MB]
@@ -101,7 +99,7 @@ options:
 
 The built-in downloader uses one independent HTTP session/TCP connection per worker. Downloaded ranges are written directly into one `.dl` file, while a small `.dl.json` sidecar records completed byte ranges. Keep both files after an interruption; the next run can resume with any `--download-threads` value. A dropped connection is recreated and resumes within its current range using exponential backoff. Use `--download-threads 1` for sequential downloading with the same retry behavior. If the server does not support byte ranges, gfile falls back to a non-resumable single connection.
 
-Uploads commit chunks strictly in order. `--window` controls the soft number of chunks in flight; one extra chunk may be admitted when every active upload is waiting to commit so the link does not idle. Memory use is normally about `window + 1` chunks and is capped by `--thread-num`.
+Uploads commit chunks strictly in order. `--window` controls the target number of chunks actively sending data. A chunk waiting to commit releases its sender slot immediately, allowing the next chunk to start without waiting for every active upload to catch up. Parked chunks still occupy memory, so total in-flight chunks and memory use are capped by `--thread-num`.
 
 ### Module
 #### Import

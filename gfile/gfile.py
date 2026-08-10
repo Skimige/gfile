@@ -169,9 +169,8 @@ class GFile:
         self.chunk_size = size_str_to_bytes(chunk_size)
         self.chunk_copy_size = size_str_to_bytes(chunk_copy_size)
         self.thread_num=thread_num
-        # in-flight window: how many chunks may normally be uploading
-        # concurrently. See the admission gate in upload_chunk for the exact
-        # semantics (it is soft in one direction to avoid idle bandwidth).
+        # Target number of chunks actively sending their bulk data. Chunks
+        # parked for an in-order commit no longer occupy a sender slot.
         self.window = max(1, window)
         self.download_threads = max(1, int(download_threads))
         self.progress = progress
@@ -224,17 +223,15 @@ class GFile:
 
     def upload_chunk(self, chunk_no, chunks):
         task_id = self.tasks[chunk_no % self.thread_num] if self.tasks else None
-        # admission gate: chunks enter the wire strictly in order, normally at
-        # most `window` ahead of the commit frontier, so a parked chunk (see
-        # the tail-hold in gen below) never idles long enough for the server
-        # to drop its connection. The window is soft in one direction: when
-        # every in-flight chunk has finished sending and is parked waiting to
-        # commit, the next chunk is admitted early so the link never sits idle
-        # while the commit chain drains. In-flight chunks -- and thus memory,
-        # at ~chunk_size each -- are capped by the worker pool (thread_num).
+        # Chunks start in order, with `window` bulk senders kept active when
+        # workers are available. A chunk parked at the tail-hold below gives
+        # up its sender slot immediately, so a faster later chunk cannot leave
+        # the connection underused while an earlier chunk is still sending.
+        # Parked chunks still occupy workers and memory, both capped by
+        # thread_num.
         with self._cond:
-            while not self.failed and not (chunk_no == self.next_send and (
-                    chunk_no - self.current_chunk < self.window or self.active_senders == 0)):
+            while not self.failed and not (
+                    chunk_no == self.next_send and self.active_senders < self.window):
                 self._cond.wait(0.05)
             if self.failed:
                 return
@@ -311,8 +308,7 @@ class GFile:
                     if task_id is not None:
                         self._progress.update(task_id, advance=piece_end - offset)
                     offset = piece_end
-                # bulk is on the wire; stop counting as a sender so the gate
-                # can admit the next chunk while this one waits for its turn.
+                # Refill this sender slot while the chunk waits for its turn.
                 release_sender()
                 if chunk_no != self.current_chunk:
                     set_state('waiting turn')
