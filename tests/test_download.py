@@ -104,9 +104,8 @@ class DownloadTestCase(unittest.TestCase):
 class DownloadResumeTests(DownloadTestCase):
     def test_resumes_existing_temporary_file(self):
         Path('example.bin.dl').write_bytes(b'abcd')
-        initial = response(b'abcdefghij')
         probe = response(b'a', status_code=206, content_range='bytes 0-0/10')
-        gfile = self.make_gfile([initial, probe], download_threads=1)
+        gfile = self.make_gfile([probe], download_threads=1)
         gfile._write_download_state('example.bin.dl', {
             'version': 2,
             'file_id': 'share',
@@ -123,26 +122,27 @@ class DownloadResumeTests(DownloadTestCase):
 
         self.assertEqual(Path('example.bin').read_bytes(), b'abcdefghij')
         self.assertFalse(Path('example.bin.dl').exists())
-        self.assertTrue(initial.closed)
-        self.assertEqual(gfile.session.requests[1][1]['headers']['Range'], 'bytes=0-0')
+        self.assertTrue(probe.closed)
+        self.assertEqual(len(gfile.session.requests), 1)
+        self.assertEqual(gfile.session.requests[0][1]['headers']['Range'], 'bytes=0-0')
         self.assertEqual(session_factory.sessions[0].requests[0][1]['headers']['Range'], 'bytes=4-9')
         self.assertEqual(session_factory.sessions[0].requests[0][1]['headers']['If-Range'], '"test-etag"')
 
     def test_restarts_when_server_ignores_range(self):
         Path('example.bin.dl').write_bytes(b'abcd')
-        initial = response(b'abcdefghij')
         restarted = response(b'abcdefghij')
-        gfile = self.make_gfile([initial, restarted])
+        gfile = self.make_gfile([restarted])
 
         self.assertEqual(gfile.download(), ['example.bin'])
 
         self.assertEqual(Path('example.bin').read_bytes(), b'abcdefghij')
+        self.assertEqual(len(gfile.session.requests), 1)
+        self.assertTrue(restarted.closed)
 
     def test_finishes_complete_temporary_file_without_range_workers(self):
         Path('example.bin.dl').write_bytes(b'abcdefghij')
-        initial = response(b'abcdefghij')
         probe = response(b'a', status_code=206, content_range='bytes 0-0/10')
-        gfile = self.make_gfile([initial, probe])
+        gfile = self.make_gfile([probe])
         gfile._write_download_state('example.bin.dl', {
             'version': 2,
             'file_id': 'share',
@@ -156,14 +156,13 @@ class DownloadResumeTests(DownloadTestCase):
         self.assertEqual(gfile.download(), ['example.bin'])
 
         self.assertEqual(Path('example.bin').read_bytes(), b'abcdefghij')
-        self.assertEqual(len(gfile.session.requests), 2)
+        self.assertEqual(len(gfile.session.requests), 1)
         self.assertEqual(session_factory.sessions, [])
 
     def test_does_not_trust_temporary_file_without_range_state(self):
         Path('example.bin.dl').write_bytes(b'xxxx')
-        initial = response(b'abcdefghij')
         probe = response(b'a', status_code=206, content_range='bytes 0-0/10')
-        gfile = self.make_gfile([initial, probe], download_threads=1)
+        gfile = self.make_gfile([probe], download_threads=1)
         session_factory = RangeSessionFactory({
             'bytes=0-9': response(b'abcdefghij', status_code=206, content_range='bytes 0-9/10'),
         })
@@ -176,9 +175,8 @@ class DownloadResumeTests(DownloadTestCase):
 
     def test_rejects_inconsistent_content_range(self):
         Path('example.bin.dl').write_bytes(b'abcd')
-        initial = response(b'abcdefghij')
         probe = response(b'a', status_code=206, content_range='bytes 5-5/10')
-        gfile = self.make_gfile([initial, probe])
+        gfile = self.make_gfile([probe])
 
         with self.assertRaisesRegex(RuntimeError, 'Invalid Content-Range'):
             gfile.download()
@@ -186,12 +184,38 @@ class DownloadResumeTests(DownloadTestCase):
         self.assertEqual(Path('example.bin.dl').read_bytes(), b'abcd')
 
 
+class DownloadProbeTests(DownloadTestCase):
+    def test_downloads_empty_file_after_unsatisfiable_probe(self):
+        probe = response(b'', status_code=416, content_range='bytes */0')
+        empty = response(b'')
+        gfile = self.make_gfile([probe, empty], size='0B')
+        self.assertEqual(gfile.download(), ['example.bin'])
+        self.assertEqual(Path('example.bin').read_bytes(), b'')
+        self.assertTrue(probe.closed)
+        self.assertTrue(empty.closed)
+        self.assertNotIn('Range', gfile.session.requests[1][1]['headers'])
+
+    def test_rejects_invalid_probe_without_creating_output(self):
+        for probe in (
+            response(b'', status_code=206, content_range='bytes 0-0/10', content_length=1),
+            response(b'ab', status_code=206, content_range='bytes 0-0/10', content_length=1),
+            response(b'a', status_code=206, content_range='bytes 0-0/10', content_length=2),
+            response(b'a', status_code=206, content_range='bytes 0-0/0'),
+            response(b'', status_code=416, content_range='bytes */10'),
+        ):
+            with self.subTest(headers=probe.headers, body=probe.body):
+                gfile = self.make_gfile([probe])
+                with self.assertRaises(RuntimeError):
+                    gfile.download()
+                self.assertTrue(probe.closed)
+                self.assertFalse(Path('example.bin.dl').exists())
+
+
 class ParallelDownloadTests(DownloadTestCase):
     def test_downloads_four_ranges_with_independent_sessions(self):
         body = b'abcdefghijkl'
-        initial = response(body)
         probe = response(b'a', status_code=206, content_range='bytes 0-0/12')
-        gfile = self.make_gfile([initial, probe], size='12B')
+        gfile = self.make_gfile([probe], size='12B')
         session_factory = RangeSessionFactory({
             'bytes=0-2': response(b'abc', status_code=206, content_range='bytes 0-2/12'),
             'bytes=3-5': response(b'def', status_code=206, content_range='bytes 3-5/12'),
@@ -215,9 +239,8 @@ class ParallelDownloadTests(DownloadTestCase):
 
     def test_resumes_state_with_a_different_thread_count(self):
         body = b'abcdefghijkl'
-        initial = response(body)
         probe = response(b'a', status_code=206, content_range='bytes 0-0/12')
-        gfile = self.make_gfile([initial, probe], download_threads=2, size='12B')
+        gfile = self.make_gfile([probe], download_threads=2, size='12B')
         partial = bytearray(12)
         partial[0:3] = b'abc'
         partial[6:9] = b'ghi'
@@ -247,9 +270,8 @@ class ParallelDownloadTests(DownloadTestCase):
 
     def test_migrates_legacy_part_files_into_single_data_file(self):
         body = b'abcdefghijkl'
-        initial = response(body)
         probe = response(b'a', status_code=206, content_range='bytes 0-0/12')
-        gfile = self.make_gfile([initial, probe], download_threads=2, size='12B')
+        gfile = self.make_gfile([probe], download_threads=2, size='12B')
         Path('example.bin.dl.json').write_text(json.dumps({
             'version': 1,
             'file_id': 'share',
@@ -273,9 +295,8 @@ class ParallelDownloadTests(DownloadTestCase):
 
     def test_reconnects_and_resumes_a_block_after_stream_failure(self):
         body = b'abcdefghijkl'
-        initial = response(body)
         probe = response(b'a', status_code=206, content_range='bytes 0-0/12')
-        gfile = self.make_gfile([initial, probe], download_threads=2, size='12B')
+        gfile = self.make_gfile([probe], download_threads=2, size='12B')
         session_factory = RangeSessionFactory({
             'bytes=0-5': response(
                 b'abc',
@@ -304,9 +325,8 @@ class ParallelDownloadTests(DownloadTestCase):
 
     def test_accepts_disconnect_after_the_last_expected_byte(self):
         body = b'abcdef'
-        initial = response(body)
         probe = response(b'a', status_code=206, content_range='bytes 0-0/6')
-        gfile = self.make_gfile([initial, probe], download_threads=1, size='6B')
+        gfile = self.make_gfile([probe], download_threads=1, size='6B')
         session_factory = RangeSessionFactory({
             'bytes=0-5': response(
                 body,
@@ -333,6 +353,24 @@ class ContentRangeTests(unittest.TestCase):
 
 
 class GigafileUrlTests(unittest.TestCase):
+    def test_parses_jp_and_legacy_share_pages_using_jp(self):
+        page = FakeResponse(b'')
+        page.text = '<span class="dl_size">10B</span><span id="dl">example.bin</span>'
+        for tld in ('jp', 'nu'):
+            with self.subTest(tld=tld):
+                gfile = GFile(f'https://12.gigafile.{tld}/example', mute=True)
+                gfile.session = FakeSession([page])
+                self.assertEqual(
+                    gfile.parse_download_page(f'https://12.gigafile.{tld}/example'),
+                    [('example.bin', '10B', 'example')],
+                )
+                self.assertEqual(gfile.session.requests[0][0], 'https://12.gigafile.jp/example')
+                self.assertEqual(gfile.file_or_url, 'https://12.gigafile.jp/example')
+
+    def test_jp_share_url_is_unchanged(self):
+        url = 'https://12.gigafile.jp/example'
+        self.assertEqual(normalize_gigafile_url(url), url)
+
     def test_normalizes_legacy_share_url(self):
         self.assertEqual(
             normalize_gigafile_url('https://12.gigafile.nu/example'),

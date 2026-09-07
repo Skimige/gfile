@@ -947,37 +947,56 @@ class GFile:
         self._cleanup_download_state(temp, legacy_parts=True)
 
 
-    def _probe_download_response(self, download_url, filesize):
-        """Return the probe response when a sequential fallback is required."""
+    def _probe_download_response(self, download_url):
+        """Fetch metadata and range support together; retain a 200 body for fallback."""
         response = self.session.get(
             download_url,
             headers={'Accept-Encoding': 'identity', 'Range': 'bytes=0-0'},
             stream=True,
         )
         try:
+            # An empty file has no satisfiable byte range. Fetch its empty body
+            # normally so filename and validator headers remain authoritative.
+            if response.status_code == 416 and response.headers.get('Content-Range') == 'bytes */0':
+                response.close()
+                response = self.session.get(
+                    download_url, headers={'Accept-Encoding': 'identity'}, stream=True,
+                )
             response.raise_for_status()
             if response.status_code == 200:
-                self._warn(
-                    'Server does not support byte ranges; using a non-resumable single connection.'
-                )
-                return response
+                filesize = int(response.headers['Content-Length'])
+                if filesize < 0:
+                    raise RuntimeError('Invalid Content-Length for download.')
+                if filesize:
+                    self._warn(
+                        'Server does not support byte ranges; using a non-resumable single connection.'
+                    )
+                return response, filesize
             if response.status_code != 206:
                 raise RuntimeError(
                     f'Unexpected HTTP {response.status_code} response to range probe.'
                 )
 
             content_range = parse_content_range(response.headers.get('Content-Range'))
-            if content_range != (0, 0, filesize):
+            if not content_range or content_range[:2] != (0, 0) or content_range[2] <= 0:
                 raise RuntimeError(
                     f'Invalid Content-Range for ranged download: '
                     f'{response.headers.get("Content-Range")!r}'
                 )
+            if response.headers.get('Content-Length', '1') != '1':
+                raise RuntimeError('Invalid Content-Length for range probe.')
+            # Drain the one-byte response to allow connection reuse.
+            received = 0
+            for chunk in response.iter_content(chunk_size=2):
+                received += len(chunk)
+                if received > 1:
+                    raise RuntimeError('Range probe exceeded one byte.')
+            if received != 1:
+                raise RuntimeError('Range probe ended before the expected byte.')
+            return response, content_range[2]
         except BaseException:
             response.close()
             raise
-
-        response.close()
-        return None
 
 
     def _download_sequentially(self, response, filename, temp, filesize):
@@ -1027,32 +1046,25 @@ class GFile:
                 run(cmd)
                 continue
 
-            request_headers = {'Accept-Encoding': 'identity'}
-            response = self.session.get(download_url, headers=request_headers, stream=True)
+            response, filesize = self._probe_download_response(download_url)
             try:
-                response.raise_for_status()
-                filesize = int(response.headers['Content-Length'])
                 header_name = filename_from_content_disposition(response.headers.get('Content-Disposition'))
                 filename = self._resolve_filename(header_name, web_name, output, idx, total)
                 temp = filename + '.dl'
                 validator = response.headers.get('ETag') or response.headers.get('Last-Modified')
                 self._info(f'Name: {filename}, size: {size_str}, id: {file_id}')
 
-                if filesize > 0:
+                if response.status_code == 206:
                     response.close()
                     response = None
-                    response = self._probe_download_response(download_url, filesize)
-                    if response is None:
-                        self._download_ranges(
-                            download_url,
-                            filename,
-                            temp,
-                            file_id,
-                            filesize,
-                            validator,
-                        )
-                    else:
-                        filesize = int(response.headers['Content-Length'])
+                    self._download_ranges(
+                        download_url,
+                        filename,
+                        temp,
+                        file_id,
+                        filesize,
+                        validator,
+                    )
 
                 if response is not None:
                     self._download_sequentially(response, filename, temp, filesize)
