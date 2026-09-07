@@ -5,7 +5,7 @@ A python CLI/module to download and upload from [gigafile](https://gigafile.jp/)
 This is a fork of [fireattack/gfile](https://github.com/fireattack/gfile) (itself a major update from [the original](https://github.com/Sraq-Zit/gfile)), with additional changes:
 
 * Stable, prettier progress bars via `rich`, with consistent IEC size units; error/retry logs no longer corrupt the bars
-* Ordered, windowed uploads keep the link busy without risking out-of-order commits, with bounded memory use and clean Ctrl+C cancellation (`--window`, `--thread-num`)
+* Ordered, windowed uploads stream from disk with small buffers, bounded task scheduling and clean Ctrl+C cancellation (`--window`, `--thread-num`)
 * More robust transfers over flaky/proxied networks: smaller default upload chunks, longer timeout, exponential-backoff retries (`--max-retries`, `--proxy`)
 * Reliable download filenames sourced from the `Content-Disposition` header (works even before the page renders / when the page name is masked)
 * Resumable downloads with four independent connections by default (`--download-threads`), or via aria2 (`--aria2`)
@@ -43,7 +43,8 @@ $ gfile -h
 usage: Gfile [-h] [--version] [-p] [-o OUTPUT] [--aria2 [ARIA2]]
              [-d DOWNLOAD_THREADS] [-n THREAD_NUM] [-w WINDOW] [-s CHUNK_SIZE]
              [-m CHUNK_COPY_SIZE] [-t TIMEOUT] [-r MAX_RETRIES]
-             [--proxy PROXY] [-k KEY] [--mute] [--verify | --no-verify]
+             [--proxy PROXY] [-k KEY] [--mute] [--performance-log PATH]
+             [--verify | --no-verify]
              {download,upload} file_or_url
 
 positional arguments:
@@ -63,8 +64,8 @@ options:
                         number of parallel connections for the built-in
                         downloader; use 1 for sequential download [default: 4]
   -n, --thread-num THREAD_NUM
-                        number of worker threads; also the hard cap on in-
-                        flight chunks and upload memory use [default: 8]
+                        number of upload worker threads; also caps pending
+                        tasks, open files and in-flight chunks [default: 8]
   -w, --window WINDOW   target number of chunks actively uploading. A chunk
                         waiting to commit gives up its sender slot so the next
                         chunk can start. gigafile commits chunks strictly in
@@ -72,14 +73,13 @@ options:
                         slow/flaky links (less wasted re-sending) while a
                         larger one is faster on good ones [default: 2]
   -s, --chunk-size CHUNK_SIZE
-                        chunk size per upload in bytes; note: each in-flight
-                        chunk holds ~chunk_size in memory, with up to
-                        thread_num chunks when later chunks repeatedly
-                        overtake earlier ones. Smaller chunks waste less on
-                        retries over flaky networks [default: 30MB]
+                        chunk size per upload in bytes; streamed from disk
+                        without buffering the whole chunk. Smaller chunks
+                        waste less on retries over flaky networks
+                        [default: 30MB]
   -m, --copy-size CHUNK_COPY_SIZE
-                        specifies size to copy the main file into pieces
-                        [default: 1MB]
+                        maximum file read size for uploads and buffer size
+                        for downloads [default: 1MB]
   -t, --timeout TIMEOUT
                         read timeout (in seconds); connect timeout is min(10,
                         timeout) [default: 30]
@@ -93,13 +93,50 @@ options:
                         specifies the key/password for the file
   --mute                mute initial message and warnings (only the final
                         result and errors will be shown)
+  --performance-log PATH
+                        append upload timing events and 5-second snapshots
+                        to a JSONL file (upload only)
   --verify              enable verification (default)
   --no-verify           disable verification
 ```
 
 The built-in downloader uses one independent HTTP session/TCP connection per worker. Downloaded ranges are written directly into one `.dl` file, while a small `.dl.json` sidecar records completed byte ranges. Keep both files after an interruption; the next run can resume with any `--download-threads` value. A dropped connection is recreated and resumes within its current range using exponential backoff. Use `--download-threads 1` for sequential downloading with the same retry behavior. If the server does not support byte ranges, gfile falls back to a non-resumable single connection.
 
-Uploads commit chunks strictly in order. `--window` controls the target number of chunks actively sending data. A chunk waiting to commit releases its sender slot immediately, allowing the next chunk to start without waiting for every active upload to catch up. Parked chunks still occupy memory, so total in-flight chunks and memory use are capped by `--thread-num`.
+Uploads commit chunks strictly in order. `--window` controls the target number of chunks actively sending data. A chunk waiting to commit releases its sender slot immediately, allowing the next chunk to start without waiting for every active upload to catch up. Each worker streams its file range through the multipart encoder in 128 KiB pieces instead of allocating the whole chunk. Pending tasks, open files and in-flight chunks are capped by `--thread-num`. Retries rewind the file range and rebuild the request, so do not modify the source file during an upload.
+
+### Transfer Performance
+
+* Upload memory no longer scales with `--chunk-size`. Larger chunks reduce HTTP request overhead, but still require more bytes to be resent after a failure. The connection pool retains enough connections for the configured upload worker count.
+* Downloads fetch size, filename, validator and Range support in a single one-byte request. If the server returns a full body instead, that same response is used for sequential downloading. This avoids the previous extra full-file GET that was closed after reading only its headers.
+* Download workers already reuse independent connections and write directly into one temporary file, without a final part-file merge. Completed blocks are still synced before their resume records are saved; this durability guarantee has not been weakened for speed.
+* Keep the default upload window of 2 and download connection count of 4 as a baseline. Compare elapsed time and retry counts while changing only one setting at a time. More connections can help a per-connection bottleneck, but cannot increase a saturated network or disk's capacity. Upload worker count must be at least the window size to make that window effective.
+
+Further changes should follow measurements on the intended connection: larger or adaptive download blocks could reduce request and sync overhead, but increase unfinished work after interruption and leave slow workers holding larger ranges. Batching resume checkpoints would reduce sync frequency, but also needs explicit crash-recovery tests. Local buffer measurements alone do not establish a speedup against the remote service.
+
+Run the transfer regression tests with `uv run python -m unittest discover -s tests -v`.
+
+### Upload Performance Logs
+
+```powershell
+uv run gfile upload "path\to\file.bin" --performance-log upload-perf.jsonl
+Get-Content .\upload-perf.jsonl -Tail 20 -Wait
+```
+
+Logging is opt-in and works with `--mute` and `--hide-progress`. JSONL records are appended, with a separate `run_id` for each upload. A background thread writes and flushes events and a snapshot every 5 seconds, including while all workers are waiting. An invalid log path fails before the upload starts; a later log write failure disables logging without aborting the transfer. The log path must not be the source file.
+
+The log contains upload settings, the selected server hostname, phase transitions, attempt results, retries, committed bytes and a final outcome. Chunk and attempt numbers start at 1, matching the progress display. It excludes source filenames, share URLs, tokens, passwords, cookies, proxy addresses and request/response bodies. Exceptions are recorded as class names, including nested causes, without their potentially sensitive messages. Hostnames, file sizes and timings are still visible in the log.
+
+* `waiting_admission`: waiting for an upload sender slot.
+* `preparing`: opening the source and preparing multipart fields.
+* `sending`: preparing the attempt, connecting and supplying the bulk body to Requests.
+* `waiting_turn`: bulk body supplied; waiting for earlier chunks to commit.
+* `sending_tail`: supplying the held-back final body segment.
+* `waiting_response`: body generator exhausted; waiting for the POST response and decoding its JSON.
+* `backoff`: waiting before retrying the chunk.
+
+`upload_attempt.phase_seconds` separates the sending, ordered waiting and response waiting time for each attempt. `upload_snapshot.active_chunks` includes the current phase and its age, so a stalled attempt is visible before it finishes. Snapshots include interval byte rates as well as the cumulative committed-byte rate. `body_bytes_yielded` includes multipart overhead and retransmissions and measures bytes supplied to Requests, not bytes confirmed on the wire. `committed_bytes` counts raw file bytes only after a successful server response. Aggregate `attempt_phase_seconds` sums finished attempts across workers, so overlapping waits can exceed wall-clock time.
+
+These are application-level timings, not separate DNS, TLS, socket-write or server-processing measurements. A long `waiting_turn` points to an earlier chunk; a long `waiting_response` needs investigation of the server, network or proxy. The `upload_end` outcome covers uploading only, before the optional remote filesize verification. A forced process termination may leave no final outcome; completed log lines remain usable.
 
 ### Module
 #### Import

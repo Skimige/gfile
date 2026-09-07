@@ -1,7 +1,6 @@
 import concurrent.futures
 import concurrent.futures.thread
 import functools
-import io
 import json
 import math
 import os
@@ -10,11 +9,12 @@ import re
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from datetime import datetime
 from os import rename
 from pathlib import Path
 from subprocess import run
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -31,6 +31,11 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 from urllib3.util.retry import Retry
+
+if __package__:
+    from .performance import UploadPerformanceLog
+else:
+    from performance import UploadPerformanceLog
 
 PRIMARY_DOMAIN = 'gigafile.jp'
 
@@ -50,6 +55,32 @@ DOWNLOAD_BLOCK_SIZE = 16 * 1024 * 1024
 
 class RangeResponseError(RuntimeError):
     pass
+
+
+class FileSlice:
+    """A bounded, streaming file view with the remaining length toolbelt needs."""
+
+    def __init__(self, source, start, size, read_size):
+        self.source = source
+        self.start = start
+        self.end = start + size
+        self.read_size = read_size
+        self.rewind()
+
+    @property
+    def len(self):
+        return self.end - self.source.tell()
+
+    def rewind(self):
+        self.source.seek(self.start)
+
+    def read(self, size=-1):
+        remaining = self.len
+        size = remaining if size is None or size < 0 else min(size, remaining)
+        data = self.source.read(min(size, self.read_size))
+        if size and not data:
+            raise OSError('Upload source ended before the chunk was fully read.')
+        return data
 
 
 def bytes_to_size_str(bytes):
@@ -108,6 +139,7 @@ def requests_retry_session(
     backoff_factor=0.2,
     status_forcelist=None, # (500, 502, 504)
     session=None,
+    pool_maxsize=10,
 ):
     session = session or requests.Session()
     retry = Retry(
@@ -115,7 +147,7 @@ def requests_retry_session(
         backoff_factor=backoff_factor,
         status_forcelist=status_forcelist,
     )
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=pool_maxsize)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     return session
@@ -162,12 +194,14 @@ def split_file(input_file, out, target_size=None, start=0, chunk_copy_size=1024*
 class GFile:
     def __init__(self, file_or_url, progress=False, thread_num=4, chunk_size=1024*1024*30, chunk_copy_size=1024*1024, timeout=30,
                  aria2=False, key=None, mute=False, verify=True, max_retries=10, proxy=None, window=2,
-                 download_threads=4, **kwargs) -> None:
+                 download_threads=4, performance_log=None, **kwargs) -> None:
         if isinstance(file_or_url, str):
             file_or_url = normalize_gigafile_url(file_or_url)
         self.file_or_url = file_or_url
         self.chunk_size = size_str_to_bytes(chunk_size)
         self.chunk_copy_size = size_str_to_bytes(chunk_copy_size)
+        if self.chunk_size <= 0 or self.chunk_copy_size <= 0:
+            raise ValueError('Chunk size and copy size must be positive.')
         self.thread_num=thread_num
         # Target number of chunks actively sending their bulk data. Chunks
         # parked for an in-order commit no longer occupy a sender slot.
@@ -177,7 +211,7 @@ class GFile:
         self.data = None
         self.timeout = timeout
         self.max_retries = max_retries
-        self.session = requests_retry_session()
+        self.session = requests_retry_session(pool_maxsize=max(10, thread_num))
         # (connect, read) timeout: fail fast on connect, be patient on read for flaky proxies.
         self.session.request = functools.partial(self.session.request, timeout=(min(10, timeout), timeout))
         if proxy:
@@ -197,6 +231,8 @@ class GFile:
         self._progress = None
         self.tasks = None
         self.total_task = None
+        self.performance_log = performance_log
+        self._performance = None
 
 
     def _info(self, msg):
@@ -222,13 +258,15 @@ class GFile:
 
 
     def upload_chunk(self, chunk_no, chunks):
+        perf = self._performance
+        if perf is not None:
+            perf.phase(chunk_no + 1, 'waiting_admission')
         task_id = self.tasks[chunk_no % self.thread_num] if self.tasks else None
         # Chunks start in order, with `window` bulk senders kept active when
         # workers are available. A chunk parked at the tail-hold below gives
         # up its sender slot immediately, so a faster later chunk cannot leave
         # the connection underused while an earlier chunk is still sending.
-        # Parked chunks still occupy workers and memory, both capped by
-        # thread_num.
+        # Parked chunks still occupy workers, capped by thread_num.
         with self._cond:
             while not self.failed and not (
                     chunk_no == self.next_send and self.active_senders < self.window):
@@ -254,28 +292,28 @@ class GFile:
                     self._cond.notify_all()
                 sender = False
 
-        try:
-            with io.BytesIO() as f:
-                split_file(self.file_or_url, f, self.chunk_size, start=chunk_no * self.chunk_size, chunk_copy_size=self.chunk_copy_size)
-                raw_size = f.tell()
-                f.seek(0)
-                fields = {
-                    "id": self.token,
-                    "name": Path(self.file_or_url).name,
-                    "chunk": str(chunk_no),
-                    "chunks": str(chunks),
-                    "lifetime": "100",
-                    "file": ("blob", f, "application/octet-stream"),
-                }
-                form_data = MultipartEncoder(fields)
-                headers = {
-                    "content-type": form_data.content_type,
-                }
-                # convert the form-data into a binary string, this way we can control/throttle its read() behavior
-                form_data_binary = form_data.to_string()
-                del form_data
-
-            size = len(form_data_binary)
+        with ExitStack() as resources:
+            resources.callback(release_sender)
+            if perf is not None:
+                perf.phase(chunk_no + 1, 'preparing')
+            source = resources.enter_context(open(self.file_or_url, 'rb'))
+            start = chunk_no * self.chunk_size
+            raw_size = min(self.chunk_size, os.fstat(source.fileno()).st_size - start)
+            if raw_size < 0:
+                raise OSError('Upload source is smaller than the requested chunk offset.')
+            file_slice = FileSlice(source, start, raw_size, self.chunk_copy_size)
+            fields = {
+                "id": self.token,
+                "name": Path(self.file_or_url).name,
+                "chunk": str(chunk_no),
+                "chunks": str(chunks),
+                "lifetime": "100",
+                "file": ("blob", file_slice, "application/octet-stream"),
+            }
+            boundary = uuid.uuid4().hex
+            form_data = MultipartEncoder(fields, boundary=boundary)
+            headers = {"content-type": form_data.content_type}
+            size = form_data.len
             update_tick = 1024 * 128
             # gigafile commits chunks strictly in ascending order -- an
             # out-of-order completion corrupts the file *silently* -- so the
@@ -304,12 +342,17 @@ class GFile:
                     if self.failed:
                         return
                     piece_end = min(offset + update_tick, bulk_end)
-                    yield form_data_binary[offset:piece_end]
+                    piece = form_data.read(piece_end - offset)
+                    if perf is not None:
+                        perf.yielded(chunk_no + 1, len(piece))
+                    yield piece
                     if task_id is not None:
                         self._progress.update(task_id, advance=piece_end - offset)
                     offset = piece_end
                 # Refill this sender slot while the chunk waits for its turn.
                 release_sender()
+                if perf is not None:
+                    perf.phase(chunk_no + 1, 'waiting_turn')
                 if chunk_no != self.current_chunk:
                     set_state('waiting turn')
                 with self._cond:
@@ -317,12 +360,19 @@ class GFile:
                         self._cond.wait(0.05)
                 if self.failed:
                     return
-                yield form_data_binary[offset:]
+                if perf is not None:
+                    perf.phase(chunk_no + 1, 'sending_tail')
+                piece = form_data.read(size - offset)
+                if perf is not None:
+                    perf.yielded(chunk_no + 1, len(piece))
+                yield piece
                 if task_id is not None:
                     self._progress.update(task_id, advance=size - offset)
                 # resumed here means the tail has been handed to the socket:
                 # the body is fully sent and we are waiting on the server.
                 set_state('waiting response')
+                if perf is not None:
+                    perf.phase(chunk_no + 1, 'waiting_response')
 
             reset_bar()
 
@@ -331,49 +381,98 @@ class GFile:
                 if self.failed:
                     return
                 become_sender()
+                http_status = None
+                if perf is not None:
+                    perf.start_attempt(chunk_no + 1, attempt + 1, size)
                 try:
+                    file_slice.rewind()
+                    form_data = MultipartEncoder(fields, boundary=boundary)
                     streamer = StreamingIterator(size, gen())
-                    resp = self.session.post(f"https://{self.server}/upload_chunk.php", data=streamer, headers=headers)
-                    resp_data = resp.json()
+                    with self.session.post(f"https://{self.server}/upload_chunk.php", data=streamer, headers=headers) as resp:
+                        http_status = resp.status_code
+                        resp.raise_for_status()
+                        resp_data = resp.json()
                 except Exception as ex:
                     # if the upload was cancelled/aborted elsewhere, the failure is
                     # just the truncated request unwinding -- bail quietly, no retry.
                     if self.failed:
+                        if perf is not None:
+                            perf.finish_attempt(chunk_no + 1, 'cancelled', error=ex, http_status=http_status)
                         return
                     # not transmitting during the backoff; let others send.
                     release_sender()
-                    wait = min(2 ** attempt, 30)
+                    wait = min(2 ** attempt, 30) if attempt + 1 < self.max_retries else 0
+                    if perf is not None:
+                        perf.finish_attempt(chunk_no + 1, 'failed', error=ex,
+                                            retry_delay=wait, http_status=http_status)
+                    if not wait:
+                        continue
+                    if perf is not None:
+                        perf.phase(chunk_no + 1, 'backoff')
                     self._warn(f'chunk {chunk_no + 1}/{chunks} failed: {ex} Retrying in {wait}s ({attempt + 1}/{self.max_retries})...')
                     time.sleep(wait)
                     # the whole chunk gets re-sent, so rewind this worker's bar.
                     reset_bar()
                 else:
+                    if perf is not None:
+                        accepted = isinstance(resp_data, dict) and 'status' in resp_data and not resp_data['status']
+                        perf.finish_attempt(chunk_no + 1, 'accepted' if accepted else 'rejected', http_status=http_status)
                     break
             else:
                 self._err(f'ERROR: chunk {chunk_no + 1}/{chunks} failed after {self.max_retries} attempts.')
                 self.failed = True
                 return
 
+            if not isinstance(resp_data, dict) or 'status' not in resp_data or resp_data['status']:
+                self._err(str(resp_data))
+                self.failed = True
+                return
+
             with self._cond:
                 self.current_chunk += 1
+                if perf is not None:
+                    perf.committed(chunk_no + 1, raw_size)
                 self._cond.notify_all()
             set_state('done')
 
             if 'url' in resp_data:
                 self.data = resp_data
-            if 'status' not in resp_data or resp_data['status']:
-                self._err(str(resp_data))
-                self.failed = True
-                return
 
             # advance the overall progress by the raw (pre-encoding) size of this chunk
             if self.total_task is not None:
                 self._progress.update(self.total_task, advance=raw_size)
-        finally:
-            release_sender()
 
 
     def upload(self):
+        if not self.performance_log:
+            return self._upload()
+        settings = {
+            'filesize': Path(self.file_or_url).stat().st_size,
+            'chunk_size': self.chunk_size,
+            'chunks': math.ceil(Path(self.file_or_url).stat().st_size / self.chunk_size),
+            'copy_size': self.chunk_copy_size,
+            'thread_num': self.thread_num,
+            'window': self.window,
+            'connect_timeout': min(10, self.timeout),
+            'read_timeout': self.timeout,
+            'max_retries': self.max_retries,
+            'proxy_configured': bool(self.session.proxies) or (
+                self.session.trust_env and any(os.environ.get(key) for key in (
+                    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy',
+                ))
+            ),
+        }
+        with UploadPerformanceLog(self.performance_log, self.file_or_url, settings, self._warn) as perf:
+            self._performance = perf
+            try:
+                result = self._upload()
+                perf.outcome = 'succeeded' if not self.failed and self.data and 'url' in self.data else 'failed'
+                return result
+            finally:
+                self._performance = None
+
+
+    def _upload(self):
         self.token = uuid.uuid1().hex
         self.failed = False
         self.current_chunk = 0
@@ -388,6 +487,8 @@ class GFile:
         self._info(f'Filesize {bytes_to_size_str(size)}, chunk size: {bytes_to_size_str(self.chunk_size)}, total chunks: {chunks}')
 
         self.server = re.search(r'var server = "(.+?)"', self.session.get(f'https://{PRIMARY_DOMAIN}/').text)[1]
+        if self._performance is not None:
+            self._performance.event('upload_server', host=urlsplit(f'https://{self.server}').hostname)
 
         if self.progress:
             self._progress = make_progress(self.console)
@@ -406,13 +507,19 @@ class GFile:
 
             # upload second to second last chunk(s)
             if not self.failed:
-                futures = {executor.submit(self.upload_chunk, i, chunks): i for i in range(1, chunks)}
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as ex:
-                        self.failed = True
-                        self._err(f'ERROR: unexpected exception in worker: {ex}')
+                next_chunk = 1
+                while next_chunk < chunks or futures:
+                    while next_chunk < chunks and len(futures) < self.thread_num:
+                        futures[executor.submit(self.upload_chunk, next_chunk, chunks)] = next_chunk
+                        next_chunk += 1
+                    done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for future in done:
+                        del futures[future]
+                        try:
+                            future.result()
+                        except Exception as ex:
+                            self.failed = True
+                            self._err(f'ERROR: unexpected exception in worker: {ex}')
                     if self.failed:
                         for fut in futures:
                             fut.cancel()
